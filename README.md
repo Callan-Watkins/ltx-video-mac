@@ -71,11 +71,13 @@ of a phone already showing your app.
 | Mac | Best quality (768×448, 2 s) | `--fast` |
 |---|---|---|
 | Apple A18 Pro, 8 GB (measured) | **20 min** | 9–19 min |
+| Apple A18 Pro, 8 GB, **10 s** clip (measured) | 7 h 24 min | — |
 | Intel i5 iMac, 16 GB (estimated from CPU speed) | about 1 hour | about 30 min |
 
 Intel Macs run everything on the CPU. PyTorch has no GPU support for the AMD Radeon or Intel graphics in Intel
 Macs, so the graphics card can't help. The Mac stays awake during a run, but the screen may still sleep.
-Closing other apps makes generation faster. An SSD is much faster than a Fusion Drive or hard drive.
+Closing other apps makes generation faster, and long clips (`--seconds 10`) need it: with 8 GB of RAM, the
+full-resolution pass of a 10 s clip runs mostly from swap. An SSD is much faster than a Fusion Drive or hard drive.
 
 ## Quality, honestly
 
