@@ -18,12 +18,16 @@ The installer:
    accepted the LTX-2.5 license yet, it gives you the link and waits;
 5. downloads about 45 GB and keeps 29.4 GB of models. The 26 GB original text encoder is compressed on your Mac
    to 10.6 GB and then deleted;
-6. adds an `ltx` command.
+6. adds an `ltx` command, then deletes everything it no longer needs: the download folder, the package caches,
+   the installer tool and any model file from an older version.
+
+The finished install is **29.4 GiB** (`du -sh ~/ltx-video` shows `29G`; Finder, which counts in decimal GB, shows
+about 31.6 GB). Running the installer again updates it and cleans up the same way.
 
 It's safe to run again. Finished steps are skipped and interrupted downloads resume.
 
-Peak disk use is about **60 GB free**: 29.4 GB of models, plus the temporary 26 GB original encoder, plus 3 GB
-for Python.
+You need about **60 GB free** while it installs: 29.4 GB of models, plus the temporary 26 GB original encoder,
+plus 3 GB for Python. About 28 GB of that is given back at the end.
 
 ## Make a video
 

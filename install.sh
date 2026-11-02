@@ -80,9 +80,11 @@ if [ ! -x "$PY" ]; then
         "$MAMBA" create -y -p "$HOME_DIR/env" -c conda-forge python=3.12 pytorch torchvision
     else
         "$MAMBA" create -y -p "$HOME_DIR/env" -c conda-forge python=3.12
-        "$PY" -m pip install -q torch torchvision
+        "$PY" -m pip install -q --no-cache-dir torch torchvision
     fi
 fi
+# The package cache and the installer binary are only needed while creating the environment.
+rm -rf "$HOME_DIR/mamba" "$MAMBA" "$HOME_DIR/env/include" "$HOME_DIR/env/pkgs"
 "$PY" -c "import torch; print('  PyTorch', torch.__version__, '| Metal GPU available' if torch.backends.mps.is_available() else '| CPU only')"
 
 # ---------------------------------------------------------------- 3. ComfyUI + Mac patches
@@ -123,8 +125,13 @@ ltx:
 EOF
 
 # Python packages ComfyUI needs. Torch comes from step 2; comfy-angle (OpenGL, optional) has no Intel build.
-grep -v -E '^(torch|torchvision|torchaudio|comfy-angle)([<>=~ ]|$)' "$HOME_DIR/ComfyUI/requirements.txt" > "$TMP/req.txt"
-"$PY" -m pip install -q --disable-pip-version-check -r "$TMP/req.txt" -r "$GG/requirements.txt" "huggingface_hub>=1.0"
+# The workflow-template gallery and node docs (~600 MB) are only for the web editor, which 'ltx' doesn't use.
+SKIP='torch|torchvision|torchaudio|comfy-angle|comfyui-workflow-templates|comfyui-embedded-docs'
+grep -v -E "^($SKIP)([<>=~ ]|\$)" "$HOME_DIR/ComfyUI/requirements.txt" > "$TMP/req.txt"
+"$PY" -m pip install -q --no-cache-dir --disable-pip-version-check -r "$TMP/req.txt" -r "$GG/requirements.txt" "huggingface_hub>=1.0"
+# Updates: remove those packages if an earlier install added them.
+OLD=$("$PY" -m pip list --format freeze 2>/dev/null | grep -iE '^comfyui[-_](workflow[-_]templates|embedded[-_]docs)' | cut -d= -f1 || true)
+[ -z "$OLD" ] || "$PY" -m pip uninstall -y -q $OLD
 say "ComfyUI ready."
 
 # ---------------------------------------------------------------- 4. Hugging Face sign-in
@@ -190,7 +197,12 @@ if [ ! -f "$M/text_encoders/$ENCODER_GGUF" ]; then
         rm -f "$DL/$F_ENCODER_BF16"   # temporary 26 GB original, no longer needed
     fi
 fi
-rm -rf "$DL/.cache" "$TMP"
+rm -rf "$DL" "$TMP" "$HOME/.cache/huggingface/xet"
+# Anything in models/ that this version no longer uses (e.g. files from an older install) is removed.
+KEEP="$(basename "$F_TRANSFORMER") $ENCODER_GGUF $(basename "$F_VIDEO_VAE") $(basename "$F_AUDIO_VAE") $(basename "$F_UPSCALER")"
+find "$M" \( -type f -o -type l \) | while read -r f; do
+    case " $KEEP " in *" $(basename "$f") "*) ;; *) say "Removing unused $(basename "$f")"; rm -f "$f" ;; esac
+done
 say "Model set: $(du -sh -L "$M" | cut -f1)"
 
 # ---------------------------------------------------------------- 6. the ltx command
@@ -206,6 +218,10 @@ for rc in "$HOME/.zshrc" "$HOME/.bash_profile"; do
     [ -f "$rc" ] || [ "$rc" = "$HOME/.zshrc" ] || continue
     grep -q "# ltx-video" "$rc" 2>/dev/null || echo "$LINE" >> "$rc"
 done
+
+# -L only for models (they may be symlinks); the env has internal symlinks that -L would count twice
+TOTAL=$(( $(du -sk -L "$M" | cut -f1) + $(du -sk "$HOME_DIR" | cut -f1) - $(du -sk "$M" | cut -f1) ))
+say "Everything installed: $(( TOTAL / 1048576 )).$(( TOTAL % 1048576 * 10 / 1048576 )) GiB on disk ($(( TOTAL * 1024 / 1000000000 )).$(( TOTAL * 1024 % 1000000000 / 100000000 )) GB in Finder), nothing left in temp or cache folders."
 
 bold "Done ($MODE). Open a new Terminal window, then:"
 say 'ltx "A golden retriever running through a sunny meadow, cinematic lighting" --open'
