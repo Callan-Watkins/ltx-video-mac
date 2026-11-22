@@ -250,7 +250,7 @@ class GGMLOps(comfy.ops.manual_cast):
 
         # Layers bigger than this (in weights) are dequantized and multiplied in row slices on MPS,
         # so a small-memory GPU never holds the whole unpacked matrix (e.g. LTX's 4096x188160 projection).
-        CHUNK_WEIGHTS = 256 * 1024 * 1024
+        CHUNK_WEIGHTS = 80 * 1024 * 1024  # 160 MB slices in bf16: fits the reused dequant buffers
 
         def forward_ggml_cast_weights(self, input):
             w = self.weight

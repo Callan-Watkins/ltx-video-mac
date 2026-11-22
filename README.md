@@ -16,17 +16,17 @@ The installer:
 3. installs a pinned, tested ComfyUI with the patched ComfyUI-GGUF loader;
 4. asks you to sign in to Hugging Face once. This is free; LTX-2.5's files require it. If your account hasn't
    accepted the LTX-2.5 license yet, it gives you the link and waits;
-5. downloads about 45 GB and keeps 29.4 GB of models. The 26 GB original text encoder is compressed on your Mac
+5. downloads about 45 GB and keeps 29.7 GB of models. The 26 GB original text encoder is compressed on your Mac
    to 10.6 GB and then deleted;
 6. adds an `ltx` command, then deletes everything it no longer needs: the download folder, the package caches,
    the installer tool and any model file from an older version.
 
-The finished install is **29.4 GiB** (`du -sh ~/ltx-video` shows `29G`; Finder, which counts in decimal GB, shows
-about 31.6 GB). Running the installer again updates it and cleans up the same way.
+The finished install is about **29.7 GiB** (`du -sh ~/ltx-video`; Finder, which counts in decimal GB, shows
+about 31.9 GB). Running the installer again updates it and cleans up the same way.
 
 It's safe to run again. Finished steps are skipped and interrupted downloads resume.
 
-You need about **60 GB free** while it installs: 29.4 GB of models, plus the temporary 26 GB original encoder,
+You need about **60 GB free** while it installs: 29.7 GB of models, plus the temporary 26 GB original encoder,
 plus 3 GB for Python. About 28 GB of that is given back at the end.
 
 ## Make a video
@@ -41,7 +41,8 @@ ltx "A golden retriever running through a sunny meadow, cinematic lighting" --op
 |---|---|
 | *(none)* | Best quality: 768×448, 49 frames (2 s), 24 fps, with sound, two-stage (draft, then 2× upscale and refine) |
 | `--fast` | Quick draft at 512×288 in a single pass, about half the time |
-| `--seconds 10` | Clip length in seconds (default 2). Time grows a bit faster than length: 10 s takes several times longer than 2 s |
+| `--seconds 10` | Clip length in seconds (default 2) |
+| `--turbo` | About 3× faster for long clips: generates at 12 fps, then LTX's official 2× temporal upscaler restores 24 fps. Very fast motion (a dog shaking its head) is a little softer |
 | `--style app` | A look tuned for marketing: `app` (hands using a phone), `product`, `people`, `animal`, or `real` (default) |
 | `--image photo.jpg` | Start the video from your own picture, e.g. a real product shot or a person holding your app. Use this when the product or screen has to look exactly right |
 | `--seed 42` | Repeat a result exactly; change the number for a different take |
@@ -58,7 +59,7 @@ is generated from the same prompt.
 ### Marketing videos
 
 ```bash
-ltx "A woman on a sofa picks up her phone, taps the screen and smiles at her golden retriever" --style app --seconds 10 --open
+ltx "A woman on a sofa picks up her phone, taps the screen and smiles at her golden retriever" --style app --seconds 10 --turbo --open
 ltx "The bottle slowly rotates on a wet black stone as water droplets catch the light" --style product --image ~/Desktop/bottle.jpg
 ```
 
@@ -71,13 +72,15 @@ of a phone already showing your app.
 | Mac | Best quality (768×448, 2 s) | `--fast` |
 |---|---|---|
 | Apple A18 Pro, 8 GB (measured) | **20 min** | 9–19 min |
-| Apple A18 Pro, 8 GB, **10 s** clip (measured) | 7 h 24 min | — |
+| Apple A18 Pro, 8 GB, **10 s** clip with `--turbo` (measured) | **25 min**, under 4 GB of RAM | — |
+| Apple A18 Pro, 8 GB, 10 s clip without `--turbo` (measured before the memory work) | 7 h 24 min | — |
 | Intel i5 iMac, 16 GB (estimated from CPU speed) | about 1 hour | about 30 min |
 
 Intel Macs run everything on the CPU. PyTorch has no GPU support for the AMD Radeon or Intel graphics in Intel
 Macs, so the graphics card can't help. The Mac stays awake during a run, but the screen may still sleep.
-Closing other apps makes generation faster, and long clips (`--seconds 10`) need it: with 8 GB of RAM, the
-full-resolution pass of a 10 s clip runs mostly from swap. An SSD is much faster than a Fusion Drive or hard drive.
+On Apple Silicon the whole job runs in under 4 GB of RAM (peak 3.7–4.0 GB measured), so other apps can stay
+open. Keep the Mac awake and plugged in: a Mac that sleeps mid-run simply pauses, and a fanless Mac that has
+been rendering for hours on battery throttles (the same 10 s clip took 36 min in that state). An SSD is much faster than a Fusion Drive or hard drive.
 
 ## Quality, honestly
 
@@ -92,16 +95,23 @@ full-resolution pass of a 10 s clip runs mostly from swap. An SSD is much faster
 ## What's patched (all in `patches/`)
 
 - **`mac_lowvram`**:
-  - Apple Silicon: streams the 16 GB model from disk one layer at a time instead of copying it into memory.
+  - Apple Silicon: streams the 16 GB model from disk instead of copying it into memory, with a fixed GPU
+    budget, a capped Metal allocator, and the video decoder and upscalers built straight in bf16 (no 3 GB
+    float32 detour). The decoded frames are kept in float16.
   - Intel: uses one CPU thread per core.
   - Everywhere: skips the tokenizer's 1,024-token padding. The output is identical (cosine 1.000000) and
     it is much faster.
 - **ComfyUI-GGUF** (Apache-2.0, city96):
   - Metal kernels to unpack 5- and 8-bit weights on Apple GPUs, bit-identical and 15–35× faster.
-  - Read-ahead file streaming.
+  - Block streaming: each transformer block's weights are gathered by a background thread and copied to the
+    GPU in one non-blocking copy into two reused buffers, instead of ~3,000 blocking copies per step. Steps
+    went from ~100 s to the GPU's own speed.
+  - Read-ahead file streaming for the text encoder.
   - Keeps weights memory-mapped instead of copying them into swap.
   - Row-gather embedding lookups and sliced huge layers, so the text encoder fits.
   - Recognizes the `gemma4` architecture.
+- **`ltx.py`** runs a clip as five short jobs (draft, upscale, refine, sound, decode) and unloads every model
+  between them, so only one stage's models are ever in memory.
 - **`tools/quantize_encoder.py`**: builds the text-encoder GGUF from the official bf16 file.
 
 ## Uninstall

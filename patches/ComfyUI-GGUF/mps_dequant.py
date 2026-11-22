@@ -91,6 +91,29 @@ def supported(data, qtype, dtype):
     return data.device.type == "mps" and qtype in _NAMES and (dtype or torch.float32) in _SUFFIX
 
 
+# Big dequantized weights are used by exactly one matmul right after they are made. Writing them into
+# a few reused buffers instead of a fresh allocation each time keeps Metal from caching gigabytes of
+# freed weight buffers. The GPU runs in order, so a buffer is only overwritten after its matmul ran.
+_RING = 3
+_ring = {}
+
+
+def _out_buffer(n, dtype, device):
+    if not (16 << 20) <= n * dtype.itemsize <= (160 << 20):  # largest video-model weight is 128 MB
+        return torch.empty(n, dtype=dtype, device=device)
+    bufs, i = _ring.get(dtype, ([], 0))
+    if len(bufs) < _RING or bufs[i].numel() < n:
+        if len(bufs) < _RING:
+            bufs.append(None)
+        bufs[i] = torch.empty(max(n, bufs[i].numel() if bufs[i] is not None else 0), dtype=dtype, device=device)
+    _ring[dtype] = (bufs, (i + 1) % _RING)
+    return bufs[i][:n]
+
+
+def release():
+    _ring.clear()
+
+
 def dequantize(data, qtype, oshape, dtype=None):
     global _lib
     if _lib is None:
@@ -99,6 +122,6 @@ def dequantize(data, qtype, oshape, dtype=None):
     block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
     src = data.view(torch.uint8).contiguous()
     n = src.numel() // type_size * block_size
-    out = torch.empty(n, dtype=dtype, device=data.device)
+    out = _out_buffer(n, dtype, data.device)
     getattr(_lib, f"{_NAMES[qtype]}_{_SUFFIX[dtype]}")(src, out, threads=n)
     return out.reshape(oshape)

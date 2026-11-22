@@ -18,6 +18,7 @@ TEXT_ENCODER = "gemma4-12b-with-proj-ltx-2.5-Q5_1-mac.gguf"
 VIDEO_VAE = "ltx-2.5-video-vae-conv-bf16.safetensors"
 AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
 UPSCALER = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+TEMPORAL_UPSCALER = "ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
 
 # Official LTX-2.5 distilled schedules (from ComfyUI's LTX-2.5 template)
 STAGE1_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
@@ -50,6 +51,11 @@ def api(path, data=None):
         return json.load(r)
 
 
+def free_all():
+    urllib.request.urlopen(urllib.request.Request(URL + "/free", data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
+                                                  headers={"Content-Type": "application/json"}), timeout=60).read()
+
+
 def server_up():
     try:
         api("/system_stats")
@@ -64,12 +70,15 @@ APPLE_SILICON = platform.machine() == "arm64"
 def start_server(gpu=False):
     (ROOT / "logs").mkdir(exist_ok=True)
     log = open(ROOT / "logs" / "server.log", "a")
-    args = [str(ROOT / "env/bin/python"), "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--disable-dynamic-vram", "--preview-method", "none", "--output-directory", str(OUT)]
+    # --cache-none: ltx.py runs a clip as several prompts and frees every model between them (see build)
+    args = [str(ROOT / "env/bin/python"), "main.py", "--listen", "127.0.0.1", "--port", "8188", "--disable-dynamic-vram",
+            "--use-pytorch-cross-attention", "--cache-none", "--preview-method", "none", "--output-directory", str(OUT)]
     if APPLE_SILICON or gpu:
-        # Cap PyTorch's Metal allocator at the GPU working set and have it release cached buffers early.
+        # Cap PyTorch's Metal allocator (Apple Silicon: 0.6 of the GPU working set, ~3.3 GB on 8 GB; mac_lowvram
+        # tightens it during the video decode) so it reuses freed buffers instead of growing: a 10 s clip stays under 4 GB.
         # Metal memory is wired: on 8 GB a bigger cache pushed everything else into swap.
-        env = dict(os.environ, PYTORCH_MPS_HIGH_WATERMARK_RATIO="1.0", PYTORCH_MPS_LOW_WATERMARK_RATIO="0.4")
+        cap = os.environ.get("LTX_MPS_CAP", "0.6" if APPLE_SILICON else "1.0")
+        env = dict(os.environ, PYTORCH_MPS_HIGH_WATERMARK_RATIO=cap, PYTORCH_MPS_LOW_WATERMARK_RATIO="0.15")
         if APPLE_SILICON:
             args.append("--bf16-text-enc")
         else:  # Intel Mac GPUs (AMD Radeon) have no bf16; compute in fp16
@@ -98,61 +107,106 @@ def swap_used_mb():
     return float(m.group(1)) if m else 0.0
 
 
+def footprint_mb(pid):
+    """(current, lifetime peak) physical footprint, the number Activity Monitor shows as Memory."""
+    import ctypes
+    buf = (ctypes.c_uint64 * 64)()
+    if not pid or ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(pid, 4, buf) != 0:
+        return 0.0, 0.0
+    return buf[9] / 2**20, buf[30] / 2**20
+
+
 def rss_mb(pid):
     s = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return int(s) / 1024 if s else 0.0
 
 
 def build(a):
-    frames = a.frames
-    fps = a.fps
-    g = {}
-    def n(i, cls, **inputs):
-        g[str(i)] = {"class_type": cls, "inputs": inputs}
-        return str(i)
+    """The workflow as a list of prompts (draft, upscale, refine, sound, decode). The server frees every model
+    between prompts, so each stage only holds its own models; LTXStash carries the latents across."""
+    # --turbo: sample at half the frame rate (half the tokens), then the official x2 temporal upscaler restores it
+    frames = (a.frames - 1) // 2 + 1 if a.turbo else a.frames
+    fps = a.fps / 2 if a.turbo else a.fps
+    phases = []
 
-    unet = n(1, "UnetLoaderGGUF", unet_name=TRANSFORMER)
-    clip = n(2, "CLIPLoaderGGUF", clip_name=TEXT_ENCODER, type="ltxv")
-    vvae = n(3, "VAELoader", vae_name=VIDEO_VAE)
-    avae = n(4, "VAELoader", vae_name=AUDIO_VAE)
-    pos = n(5, "CLIPTextEncode", text=a.full_prompt, clip=[clip, 0])
-    if a.image:  # official LTX-2.5 image-to-video recipe: resize, mild JPEG-like preprocessing, lock the first frame
+    def phase():
+        g = {}
+        phases.append(g)
+        def n(i, cls, **inputs):
+            g[str(i)] = {"class_type": cls, "inputs": inputs}
+            return str(i)
+        return n
+
+    def image_nodes(n):  # official LTX-2.5 image-to-video recipe: resize, mild JPEG-like preprocessing, lock the first frame
         img = n(40, "LoadImage", image=a.image)
         img = n(41, "ResizeImageMaskNode", input=[img, 0], **{"resize_type": "scale longer dimension",
                 "resize_type.longer_size": 1536, "scale_method": "lanczos"})
-        img = n(42, "LTXVPreprocess", image=[img, 0], img_compression=18)
+        return n(42, "LTXVPreprocess", image=[img, 0], img_compression=18)
+
+    def sample(n, latent, sigmas, seed, pos, neg):
+        unet = n(1, "UnetLoaderGGUF", unet_name=TRANSFORMER)
+        guider = n(8, "LTXVDualCFGGuider", model=[unet, 0], positive=pos, negative=neg, video_cfg=1.0, audio_cfg=1.0)
+        s = n(13, "SamplerCustomAdvanced", noise=[n(14, "RandomNoise", noise_seed=seed), 0], guider=[guider, 0],
+              sampler=[n(9, "KSamplerSelect", sampler_name="euler_ancestral"), 0],
+              sigmas=[n(15, "ManualSigmas", sigmas=sigmas), 0], latent_image=latent)
+        sep = n(16, "LTXVSeparateAVLatent", av_latent=[s, 0])
+        n(17, "LTXStash", key="video", latent=[sep, 0])
+        n(18, "LTXStash", key="audio", latent=[sep, 1])
+
+    # 1. text encoding and the first (draft) pass
+    n = phase()
+    clip = n(2, "CLIPLoaderGGUF", clip_name=TEXT_ENCODER, type="ltxv")
+    avae = n(4, "VAELoader", vae_name=AUDIO_VAE)
+    pos = n(5, "CLIPTextEncode", text=a.full_prompt, clip=[clip, 0])
     if a.negative:
         neg = n(6, "CLIPTextEncode", text=a.negative, clip=[clip, 0])
     else:  # CFG is 1 for the distilled model, so the negative is unused; skip a second Gemma pass
         neg = n(6, "ConditioningZeroOut", conditioning=[pos, 0])
     cond = n(7, "LTXVConditioning", positive=[pos, 0], negative=[neg, 0], frame_rate=float(fps))
-    guider = n(8, "LTXVDualCFGGuider", model=[unet, 0], positive=[cond, 0], negative=[cond, 1], video_cfg=1.0, audio_cfg=1.0)
-    sampler = n(9, "KSamplerSelect", sampler_name="euler_ancestral")
-
+    n(30, "LTXStash", key="pos", conditioning=[cond, 0])
+    n(31, "LTXStash", key="neg", conditioning=[cond, 1])
     w1, h1 = (a.width // 2, a.height // 2) if a.two_stage else (a.width, a.height)
     vlat = n(10, "EmptyLTXVLatentVideo", width=w1, height=h1, length=frames, batch_size=1)
     if a.image:
-        vlat = n(43, "LTXVImgToVideoInplace", vae=[vvae, 0], image=[img, 0], latent=[vlat, 0],
-                 strength=0.7 if a.two_stage else 1.0, bypass=False)
+        vlat = n(43, "LTXVImgToVideoInplace", vae=[n(3, "VAELoader", vae_name=VIDEO_VAE), 0], image=[image_nodes(n), 0],
+                 latent=[vlat, 0], strength=0.7 if a.two_stage else 1.0, bypass=False)
     alat = n(11, "LTXVEmptyLatentAudio", frames_number=frames, frame_rate=int(fps), batch_size=1, audio_vae=[avae, 0])
     av = n(12, "LTXVConcatAVLatent", video_latent=[vlat, 0], audio_latent=[alat, 0])
-    s1 = n(13, "SamplerCustomAdvanced", noise=[n(14, "RandomNoise", noise_seed=a.seed), 0], guider=[guider, 0],
-           sampler=[sampler, 0], sigmas=[n(15, "ManualSigmas", sigmas=STAGE1_SIGMAS), 0], latent_image=[av, 0])
-    sep = n(16, "LTXVSeparateAVLatent", av_latent=[s1, 0])
+    sample(n, [av, 0], STAGE1_SIGMAS, a.seed, [cond, 0], [cond, 1])
+
     if a.two_stage:
-        up = n(17, "LTXVLatentUpsampler", samples=[sep, 0], upscale_model=[n(18, "LatentUpscaleModelLoader", model_name=UPSCALER), 0], vae=[vvae, 0])
+        # 2. x2 latent upscale
+        n = phase()
+        up = n(20, "LTXLatentUpsamplerStats", samples=[n(19, "LTXUnstashLatent", key="video"), 0],
+               upscale_model=[n(21, "LatentUpscaleModelLoader", model_name=UPSCALER), 0], vae_name=VIDEO_VAE)
         if a.image:
-            up = n(44, "LTXVImgToVideoInplace", vae=[vvae, 0], image=[img, 0], latent=[up, 0], strength=1.0, bypass=False)
-        av2 = n(19, "LTXVConcatAVLatent", video_latent=[up, 0], audio_latent=[sep, 1])
-        s2 = n(20, "SamplerCustomAdvanced", noise=[n(21, "RandomNoise", noise_seed=a.seed + 1), 0], guider=[guider, 0],
-               sampler=[sampler, 0], sigmas=[n(22, "ManualSigmas", sigmas=STAGE2_SIGMAS), 0], latent_image=[av2, 0])
-        sep = n(23, "LTXVSeparateAVLatent", av_latent=[s2, 0])
-    images = n(30, "VAEDecodeTiled", samples=[sep, 0], vae=[vvae, 0], tile_size=a.tile, overlap=64, temporal_size=64, temporal_overlap=16)
-    audio = n(31, "LTXVAudioVAEDecode", samples=[sep, 1], audio_vae=[avae, 0])
-    video = n(32, "CreateVideo", images=[images, 0], audio=[audio, 0], fps=float(fps))
-    n(33, "SaveVideo", video=[video, 0], filename_prefix=f"ltx25/{a.name}", format="mp4",
+            up = n(44, "LTXVImgToVideoInplace", vae=[n(3, "VAELoader", vae_name=VIDEO_VAE), 0], image=[image_nodes(n), 0],
+                   latent=[up, 0], strength=1.0, bypass=False)
+        n(22, "LTXStash", key="video", latent=[up, 0])
+        # 3. refine at full resolution
+        n = phase()
+        av = n(12, "LTXVConcatAVLatent", video_latent=[n(19, "LTXUnstashLatent", key="video"), 0],
+               audio_latent=[n(20, "LTXUnstashLatent", key="audio"), 0])
+        sample(n, [av, 0], STAGE2_SIGMAS, a.seed + 1,
+               [n(30, "LTXUnstashConditioning", key="pos"), 0], [n(31, "LTXUnstashConditioning", key="neg"), 0])
+
+    # 4. sound (and, for turbo, the x2 temporal upscale), then 5. the video decode on its own
+    n = phase()
+    audio = n(27, "LTXVAudioVAEDecode", samples=[n(20, "LTXUnstashLatent", key="audio"), 0],
+              audio_vae=[n(4, "VAELoader", vae_name=AUDIO_VAE), 0])
+    n(30, "LTXStash", key="sound", audio=[audio, 0])
+    if a.turbo:
+        up = n(24, "LTXLatentUpsamplerStats", samples=[n(19, "LTXUnstashLatent", key="video"), 0], vae_name=VIDEO_VAE,
+               upscale_model=[n(25, "LatentUpscaleModelLoader", model_name=TEMPORAL_UPSCALER), 0])
+        n(26, "LTXStash", key="video", latent=[up, 0])
+    n = phase()
+    vvae = n(3, "VAELoader", vae_name=VIDEO_VAE)
+    images = n(26, "VAEDecodeTiled", samples=[n(19, "LTXUnstashLatent", key="video"), 0], vae=[vvae, 0],
+               tile_size=a.tile, overlap=64, temporal_size=64, temporal_overlap=16)
+    out = n(28, "CreateVideo", images=[images, 0], audio=[n(27, "LTXUnstashAudio", key="sound"), 0], fps=float(a.fps))
+    n(29, "SaveVideo", video=[out, 0], filename_prefix=f"ltx25/{a.name}", format="mp4",
       **{"format.codec": "h264", "format.codec.encoding": "re-encode", "format.codec.encoding.crf": 16.0})
-    return g
+    return phases
 
 
 def main():
@@ -168,6 +222,7 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--fast", action="store_true", help="quick draft: 512x288 single pass (default is the sharper two-stage 768x448)")
     ap.add_argument("--two-stage", action="store_true", help="(default unless --fast) half-res pass + 2x latent upscale + refine")
+    ap.add_argument("--turbo", action="store_true", help="about 3x faster long clips: sample at half frame rate, then x2 temporal upscale")
     ap.add_argument("--raw", action="store_true", help="use the prompt exactly as written, without the photoreal style suffix")
     ap.add_argument("--negative", default="", help="optional; distilled model runs at CFG 1 so it has little effect")
     ap.add_argument("--tile", type=int, default=256, help="VAE decode tile size (smaller = less RAM)")
@@ -187,7 +242,10 @@ def main():
     else:
         a.two_stage = True
     if a.seconds:
-        a.frames = round(a.seconds * a.fps / 8) * 8 + 1
+        step = 16 if a.turbo else 8  # turbo samples (frames-1)/2+1 frames, which must also be 8n+1
+        a.frames = round(a.seconds * a.fps / step) * step + 1
+    if a.turbo and (a.frames - 1) % 16:
+        sys.exit("--turbo needs --frames of the form 16n+1, e.g. 97, 241")
     a.full_prompt = a.prompt.rstrip() + ("" if a.raw else REALISM + STYLES[a.style])
     if a.image:
         src = Path(a.image).expanduser().resolve()
@@ -213,56 +271,66 @@ def main():
     awake = subprocess.Popen(["caffeinate", "-i", "-w", str(pid)]) if pid else None
 
     swap0 = swap_used_mb()
-    pid_resp = api("/prompt", {"prompt": build(a)})
-    if pid_resp.get("node_errors"):
-        sys.exit(json.dumps(pid_resp, indent=1))
-    prompt_id = pid_resp["prompt_id"]
-    print(f"Queued {prompt_id}: {a.width}x{a.height}, {a.frames} frames @ {a.fps} fps, seed {a.seed}, "
-          f"{'two-stage' if a.two_stage else 'single-stage'}", flush=True)
+    phases = build(a)
+    print(f"{a.width}x{a.height}, {a.frames} frames @ {a.fps} fps, seed {a.seed}, "
+          f"{'two-stage' if a.two_stage else 'single-stage'}{', turbo' if a.turbo else ''}: {len(phases)} parts", flush=True)
 
-    t0 = time.time(); peak_rss = peak_swap = 0.0; last = 0
+    t0 = time.time(); peak_rss = peak_swap = peak_fp = 0.0; last = 0
     log_path = ROOT / "logs" / "server.log"
-    log_pos = log_path.stat().st_size if log_path.exists() else 0
-    stages = {}  # first time (s since queue) each stage marker shows up in the server log
-    while True:
-        time.sleep(3)
-        if log_path.exists():
-            with open(log_path, "rb") as lf:
-                lf.seek(log_pos)
-                chunk = lf.read().decode("utf-8", "replace")
-                log_pos = lf.tell()
-            for marker, stage in (("Requested to load LTXAVTEModel", "text_encode"), ("Requested to load LTXAV\n", "sampling"),
-                                  ("Requested to load AudioVAE", "decode"), ("Prompt executed", "done")):
-                if marker in chunk and stage not in stages:
-                    stages[stage] = round(time.time() - t0)
-                    print(f"  [{stages[stage]}s] {stage}", flush=True)
-        if pid:
-            peak_rss = max(peak_rss, rss_mb(pid))
-        peak_swap = max(peak_swap, swap_used_mb())
-        try:
-            h = api(f"/history/{prompt_id}")
-        except Exception:
-            h = {}
-        if prompt_id in h:
-            st = h[prompt_id].get("status", {})
-            if st.get("completed") or st.get("status_str") in ("success", "error"):
-                break
-        if not server_up():
-            sys.exit("ComfyUI server died (likely out of memory); see logs/server.log")
-        if time.time() - last > 60:
-            print(f"  ... {time.time()-t0:.0f}s  server RSS {rss_mb(pid) if pid else 0:.0f} MB  swap {swap_used_mb():.0f} MB", flush=True)
-            last = time.time()
+    stages = {}  # first time (s since start) each stage marker shows up in the server log
+    part_peaks = []  # the server's peak RAM so far, after each part
+    for i, graph in enumerate(phases, 1):
+        if i > 1:  # unload every model and return their memory before the next part
+            free_all()
+        log_pos = log_path.stat().st_size if log_path.exists() else 0
+        pid_resp = api("/prompt", {"prompt": graph})
+        if pid_resp.get("node_errors"):
+            sys.exit(json.dumps(pid_resp, indent=1))
+        prompt_id = pid_resp["prompt_id"]
+        print(f"  [{time.time()-t0:.0f}s] part {i}/{len(phases)}", flush=True)
+        while True:
+            time.sleep(3)
+            if log_path.exists():
+                with open(log_path, "rb") as lf:
+                    lf.seek(log_pos)
+                    chunk = lf.read().decode("utf-8", "replace")
+                    log_pos = lf.tell()
+                for marker, stage in (("Requested to load LTXAVTEModel", "text_encode"), ("Requested to load LTXAV\n", "sampling"),
+                                      ("Requested to load VideoVAE", "decode")):
+                    if marker in chunk and stage not in stages:
+                        stages[stage] = round(time.time() - t0)
+                        print(f"  [{stages[stage]}s] {stage}", flush=True)
+            if pid:
+                peak_rss = max(peak_rss, rss_mb(pid))
+                peak_fp = max(peak_fp, footprint_mb(pid)[1])
+            peak_swap = max(peak_swap, swap_used_mb())
+            try:
+                h = api(f"/history/{prompt_id}")
+            except Exception:
+                h = {}
+            if prompt_id in h:
+                st = h[prompt_id].get("status", {})
+                if st.get("completed") or st.get("status_str") in ("success", "error"):
+                    break
+            if not server_up():
+                sys.exit("ComfyUI server died (likely out of memory); see logs/server.log")
+            if time.time() - last > 60:
+                print(f"  ... {time.time()-t0:.0f}s  RAM {footprint_mb(pid)[0]:.0f} MB (peak {footprint_mb(pid)[1]:.0f})  swap {swap_used_mb():.0f} MB", flush=True)
+                last = time.time()
+        rec = h[prompt_id]
+        part_peaks.append(round(footprint_mb(pid)[1]))
+        if rec["status"].get("status_str") != "success":
+            print(json.dumps(rec["status"], indent=1)[-4000:])
+            sys.exit(f"Generation failed in part {i}")
+    free_all()  # the server stays up for the next clip, but without holding gigabytes in the meantime
+    stages["done"] = round(time.time() - t0)
     elapsed = time.time() - t0
-    rec = h[prompt_id]
-    if rec["status"].get("status_str") != "success":
-        print(json.dumps(rec["status"], indent=1)[-4000:])
-        sys.exit("Generation failed")
     files = [OUT / v["subfolder"] / v["filename"] for o in rec["outputs"].values() for k in ("images", "videos", "gifs")
              for v in o.get(k, []) if "filename" in v]
     files = files or sorted((OUT / "ltx25").glob(a.name + "*"))
     report = {"prompt": a.prompt, "full_prompt": a.full_prompt, "width": a.width, "height": a.height, "frames": a.frames, "fps": a.fps,
               "seconds": round(a.frames / a.fps, 2), "seed": a.seed, "two_stage": a.two_stage, "style": a.style, "image": a.image,
-              "elapsed_s": round(elapsed), "stage_start_s": stages, "peak_server_rss_mb": round(peak_rss), "swap_before_mb": round(swap0),
+              "turbo": a.turbo, "elapsed_s": round(elapsed), "stage_start_s": stages, "peak_server_rss_mb": round(peak_rss), "peak_ram_mb": round(peak_fp), "peak_ram_after_part_mb": part_peaks, "swap_before_mb": round(swap0),
               "peak_swap_mb": round(peak_swap), "files": [str(f) for f in files],
               "file_bytes": [f.stat().st_size for f in files if f.exists()]}
     for f in files:

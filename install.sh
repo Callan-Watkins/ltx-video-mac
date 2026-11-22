@@ -21,6 +21,7 @@ F_ENCODER_BF16="text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
 F_VIDEO_VAE="vae/ltx-2.5-video-vae-conv-bf16.safetensors"
 F_AUDIO_VAE="vae/ltx-2.5-audio-vae-bf16.safetensors"
 F_UPSCALER="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+F_TEMPORAL="latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
 ENCODER_GGUF="gemma4-12b-with-proj-ltx-2.5-Q5_1-mac.gguf"
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -62,6 +63,7 @@ NEED=$(( 3 * 1000000000 ))  # Python environment + ComfyUI
 [ -f "$HOME_DIR/models/diffusion_models/$(basename "$F_TRANSFORMER")" ] || NEED=$(( NEED + 16000033152 ))
 [ -f "$HOME_DIR/models/text_encoders/$ENCODER_GGUF" ] || NEED=$(( NEED + 10621378272 + 26263858182 ))  # bf16 download is temporary
 [ -f "$HOME_DIR/models/vae/$(basename "$F_VIDEO_VAE")" ] || NEED=$(( NEED + 1452269922 + 364866540 + 995778752 ))
+[ -f "$HOME_DIR/models/latent_upscale_models/$(basename "$F_TEMPORAL")" ] || NEED=$(( NEED + 261944000 ))
 [ -n "${LTX_MODELS_FROM:-}" ] && NEED=$(( 3 * 1000000000 ))
 [ "$FREE" -ge "$NEED" ] || die "needs about $(gb "$NEED") GB free disk for the download (only $(gb "$FREE") GB free). Free some space and re-run."
 
@@ -166,8 +168,8 @@ else
     say "Skipped: using existing model files from $LTX_MODELS_FROM"
 fi
 
-# ---------------------------------------------------------------- 5. models (29.4 GB)
-bold "5/6  Model files (~29.4 GB total; downloads resume if interrupted)"
+# ---------------------------------------------------------------- 5. models (29.7 GB)
+bold "5/6  Model files (~29.7 GB total; downloads resume if interrupted)"
 M="$HOME_DIR/models"; DL="$HOME_DIR/downloads"
 mkdir -p "$M/diffusion_models" "$M/text_encoders" "$M/vae" "$M/latent_upscale_models" "$DL"
 get() {  # repo, path-in-repo, destination folder
@@ -184,6 +186,7 @@ get "$GGUF_REPO" "$F_TRANSFORMER" "$M/diffusion_models"
 get "$LTX_REPO" "$F_VIDEO_VAE" "$M/vae"
 get "$LTX_REPO" "$F_AUDIO_VAE" "$M/vae"
 get "$LTX_REPO" "$F_UPSCALER" "$M/latent_upscale_models"
+get "$LTX_REPO" "$F_TEMPORAL" "$M/latent_upscale_models"
 if [ ! -f "$M/text_encoders/$ENCODER_GGUF" ]; then
     if [ -n "${LTX_MODELS_FROM:-}" ]; then
         get "" "$ENCODER_GGUF" "$M/text_encoders"
@@ -199,7 +202,7 @@ if [ ! -f "$M/text_encoders/$ENCODER_GGUF" ]; then
 fi
 rm -rf "$DL" "$TMP" "$HOME/.cache/huggingface/xet"
 # Anything in models/ that this version no longer uses (e.g. files from an older install) is removed.
-KEEP="$(basename "$F_TRANSFORMER") $ENCODER_GGUF $(basename "$F_VIDEO_VAE") $(basename "$F_AUDIO_VAE") $(basename "$F_UPSCALER")"
+KEEP="$(basename "$F_TRANSFORMER") $ENCODER_GGUF $(basename "$F_VIDEO_VAE") $(basename "$F_AUDIO_VAE") $(basename "$F_UPSCALER") $(basename "$F_TEMPORAL")"
 find "$M" \( -type f -o -type l \) | while read -r f; do
     case " $KEEP " in *" $(basename "$f") "*) ;; *) say "Removing unused $(basename "$f")"; rm -f "$f" ;; esac
 done

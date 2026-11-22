@@ -14,9 +14,22 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
+from . import stream
 from .ops import GGMLOps, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
+
+# Unloading everything (e.g. the /free endpoint) does not go through unpatch_model, so also drop the
+# block streamer's buffers there.
+_unload_all_models = comfy.model_management.unload_all_models
+
+
+def unload_all_models(*args, **kwargs):
+    _unload_all_models(*args, **kwargs)
+    stream.release_blocks()
+
+
+comfy.model_management.unload_all_models = unload_all_models
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -75,6 +88,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 patches = getattr(p, "patches", [])
                 if len(patches) > 0:
                     p.patches = []
+        stream.release_blocks()
         # TODO: Find another way to not unload after patches
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
@@ -97,6 +111,11 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             self.mmap_released = True
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
+
+        # Block-streamed weights are views into GPU buffers that are reused every two blocks, so none
+        # of them may stay loaded on the GPU between steps: give lowvram loading no budget.
+        if stream.BLOCKS and kwargs.get("lowvram_model_memory", 0) > 0:
+            kwargs["lowvram_model_memory"] = 1
 
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)

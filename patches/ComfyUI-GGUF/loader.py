@@ -121,6 +121,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     # main loading loop
     state_dict = {}
     qtype_dict = {}
+    blocks = {}
     for sd_key, tensor in tensors:
         tensor_name = tensor.name
         # torch_tensor = torch.from_numpy(tensor.data) # mmap
@@ -143,7 +144,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
-        if stream.ENABLED and tensor.n_bytes >= stream.MIN_BYTES:
+        grouped = stream.BLOCKS and not is_text_model
+        if grouped:
+            blocks.setdefault(stream.group_of(tensor_name), []).append((int(tensor.data_offset), int(tensor.n_bytes)))
+        if grouped or (stream.ENABLED and tensor.n_bytes >= stream.MIN_BYTES):
             state_dict[sd_key]._gguf_src = (path, int(tensor.data_offset), int(tensor.n_bytes))
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16
@@ -153,6 +157,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
         qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+
+    if blocks:
+        stream.block_streamer(path, blocks)
 
     # print loaded tensor type counts
     logging.info("gguf qtypes: " + ", ".join(f"{k} ({v})" for k, v in qtype_dict.items()))
